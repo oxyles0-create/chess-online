@@ -1,6 +1,7 @@
 import { Chess } from 'https://cdn.jsdelivr.net/npm/chess.js@1.0.0/+esm';
 import { Board, pieceUrl } from './board.js';
-import { Engine, MATE } from './engine.js';
+import { Engine, MATE, DEPTH } from './engine.js';
+import { Sounds } from './sounds.js';
 import { CLASSES, BAD, winPct, formatScore, classifyMove, isSacrifice } from './analysis.js';
 import { Net } from './net.js';
 
@@ -14,10 +15,11 @@ const lsGet = (k, d = null) => { try { return localStorage.getItem(k) ?? d; } ca
 const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch {} };
 const lsDel = (k) => { try { localStorage.removeItem(k); } catch {} };
 
-const DEFAULTS = { evalBar: true, classify: true, bestMove: false, coords: true, sound: true, depth: 14 };
+const DEFAULTS = { evalBar: true, classify: true, bestMove: false, coords: true, sound: true };
 const settings = (() => {
   try { return { ...DEFAULTS, ...JSON.parse(lsGet('chess.settings', '{}')) }; } catch { return { ...DEFAULTS }; }
 })();
+Sounds.enabled = settings.sound;
 const saveSettings = () => lsSet('chess.settings', JSON.stringify(settings));
 
 let clientId = lsGet('chess.clientId');
@@ -43,6 +45,7 @@ const S = {
   connected: false,
   drawOffer: null, // 'me' | 'them'
   rematchOffer: null,
+  premove: null, // {from, to}
 };
 
 // ---------- движок ----------
@@ -50,6 +53,7 @@ let engineState = 'loading';
 const engine = new Engine((st) => { engineState = st; requestAnalysis(); render(); });
 const evalCache = new Map(); // fen -> {score, best, pv, depth}
 const pending = new Set();
+const progress = new Map(); // fen -> достигнутая глубина
 const classCache = new Map();
 const engineWanted = () => settings.evalBar || settings.classify || settings.bestMove;
 
@@ -71,8 +75,14 @@ function requestAnalysis() {
     if (t) { evalCache.set(fen, t); continue; }
     if (engineState !== 'ready') continue;
     pending.add(fen);
-    engine.analyze(fen, { depth: settings.depth, movetime: 2000, urgent: i >= lastPly - 1 }).then((res) => {
+    const onProgress = (d) => {
+      progress.set(fen, d);
+      const p = curPly();
+      if (S.positions[p] === fen || S.positions[p - 1] === fen) refreshFeedback();
+    };
+    engine.analyze(fen, { urgent: i >= lastPly - 1, onProgress }).then((res) => {
       pending.delete(fen);
+      progress.delete(fen);
       if (res) evalCache.set(fen, res);
       render();
     });
@@ -107,22 +117,82 @@ function uciToSan(fen, uci) {
 // ---------- доска ----------
 const board = new Board($('#board'), {
   canMove,
-  targets: (sq) => S.game.moves({ square: sq, verbose: true }).map((m) => m.to),
+  targets: (sq) => (premoveMode()
+    ? premoveTargets(sq)
+    : S.game.moves({ square: sq, verbose: true }).map((m) => m.to)),
   onMove: userMove,
+  onDeselect: () => {
+    if (S.premove) { S.premove = null; render(); }
+  },
 });
 
 function isLive() { return S.viewPly === null; }
+
+// Сейчас ход соперника — свои фигуры можно двигать как премув.
+function premoveMode() {
+  return S.mode === 'online' && !S.result && S.game.turn() !== S.myColor;
+}
 
 function canMove(sq) {
   if (S.mode !== 'local' && S.mode !== 'online') return false;
   if (S.result || !isLive()) return false;
   const p = S.game.get(sq);
-  if (!p || p.color !== S.game.turn()) return false;
-  if (S.mode === 'online' && (p.color !== S.myColor || !S.connected)) return false;
-  return true;
+  if (!p) return false;
+  if (S.mode === 'local') return p.color === S.game.turn();
+  if (p.color !== S.myColor) return false;
+  return premoveMode() || S.connected;
+}
+
+// Куда фигура может пойти «в принципе» (для премува): по правилам хода фигуры,
+// не учитывая, что поля могут освободиться или заняться после хода соперника.
+function premoveTargets(sq) {
+  const p = S.game.get(sq);
+  if (!p) return [];
+  const F = 'abcdefgh';
+  const f = F.indexOf(sq[0]), r = +sq[1] - 1;
+  const out = [];
+  const add = (ff, rr) => { if (ff >= 0 && ff < 8 && rr >= 0 && rr < 8) out.push(F[ff] + (rr + 1)); };
+  const ray = (dirs) => {
+    for (const [df, dr] of dirs) for (let k = 1; k < 8; k++) add(f + df * k, r + dr * k);
+  };
+  const ORTH = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+  const DIAG = [[1, 1], [1, -1], [-1, 1], [-1, -1]];
+  switch (p.type) {
+    case 'p': {
+      const dir = p.color === 'w' ? 1 : -1;
+      add(f, r + dir);
+      if (r === (p.color === 'w' ? 1 : 6)) add(f, r + 2 * dir);
+      add(f - 1, r + dir);
+      add(f + 1, r + dir);
+      break;
+    }
+    case 'n':
+      for (const [df, dr] of [[1, 2], [2, 1], [-1, 2], [-2, 1], [1, -2], [2, -1], [-1, -2], [-2, -1]]) add(f + df, r + dr);
+      break;
+    case 'b': ray(DIAG); break;
+    case 'r': ray(ORTH); break;
+    case 'q': ray([...ORTH, ...DIAG]); break;
+    case 'k': {
+      for (const [df, dr] of [...ORTH, ...DIAG]) add(f + df, r + dr);
+      const rights = S.game.getCastlingRights(p.color);
+      if (f === 4 && r === (p.color === 'w' ? 0 : 7)) {
+        if (rights.k) add(6, r);
+        if (rights.q) add(2, r);
+      }
+      break;
+    }
+  }
+  // Поля со своими фигурами оставляем: соперник может побить фигуру, и мы отыграем.
+  return out;
 }
 
 async function userMove(from, to) {
+  if (premoveMode()) {
+    S.premove = { from, to };
+    Sounds.play('premove');
+    render();
+    return;
+  }
   const cands = S.game.moves({ square: from, verbose: true }).filter((m) => m.to === to);
   if (!cands.length) return;
   let promotion;
@@ -130,10 +200,25 @@ async function userMove(from, to) {
     promotion = await board.askPromotion(S.game.turn());
     if (!promotion) { render(); return; }
   }
+  makeMyMove(from, to, promotion);
+}
+
+function makeMyMove(from, to, promotion) {
   const mv = applyMove({ from, to, promotion });
   if (mv && S.mode === 'online') {
     net?.send({ t: 'move', gameNo: S.gameNo, ply: S.moves.length - 1, from, to, promotion });
   }
+  return mv;
+}
+
+// После хода соперника выполнить премув, если он стал легальным.
+function tryPremove() {
+  const pm = S.premove;
+  S.premove = null;
+  if (!pm || S.result || S.game.turn() !== S.myColor || !S.connected) { render(); return; }
+  const cands = S.game.moves({ square: pm.from, verbose: true }).filter((m) => m.to === pm.to);
+  if (!cands.length) { render(); return; }
+  makeMyMove(pm.from, pm.to, cands.some((m) => m.promotion) ? 'q' : undefined);
 }
 
 function applyMove({ from, to, promotion }, { silent = false } = {}) {
@@ -145,7 +230,11 @@ function applyMove({ from, to, promotion }, { silent = false } = {}) {
   S.viewPly = null;
   S.drawOffer = null;
   checkGameEnd();
-  if (!silent) sound(mv);
+  if (!silent) {
+    board.clearAnnotations();
+    Sounds.forMove(mv, S.game.inCheck(), !!S.result);
+  }
+  if (S.result) S.premove = null;
   requestAnalysis();
   render();
   return mv;
@@ -168,29 +257,12 @@ function resetGame() {
   S.viewPly = null;
   S.drawOffer = null;
   S.rematchOffer = null;
+  S.premove = null;
   board.clearSelection();
+  board.clearAnnotations();
   engine.reset();
   pending.clear();
   requestAnalysis();
-}
-
-// ---------- звук ----------
-let actx;
-function sound(mv) {
-  if (!settings.sound) return;
-  try {
-    actx ??= new AudioContext();
-    const t = actx.currentTime;
-    const o = actx.createOscillator(), g = actx.createGain();
-    o.type = 'triangle';
-    o.frequency.value = mv.captured ? 300 : S.game.inCheck() ? 700 : 480;
-    g.gain.setValueAtTime(0.0001, t);
-    g.gain.exponentialRampToValueAtTime(0.25, t + 0.01);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.13);
-    o.connect(g).connect(actx.destination);
-    o.start(t);
-    o.stop(t + 0.15);
-  } catch {}
 }
 
 // ---------- отрисовка ----------
@@ -218,13 +290,15 @@ function render() {
   board.orientation = S.orientation;
   board.render({
     pieces, check, arrows, coords: settings.coords,
+    premove: isLive() && !S.result ? S.premove : null,
+    premoveMode: premoveMode(),
     lastMove: last ? { from: last.from, to: last.to } : null,
     badge: cls && last ? { sq: last.to, ...CLASSES[cls.key] } : null,
   });
   renderEval(an);
   renderStrips(g);
   renderMoves();
-  renderFeedback(ply, cls, an);
+  refreshFeedback();
   renderStatus();
   renderActions();
   if (S.isHost && S.mode === 'online') saveHostSession();
@@ -315,6 +389,17 @@ function renderMoves() {
     : '';
 }
 
+function refreshFeedback() {
+  if (S.mode !== 'local' && S.mode !== 'online') return;
+  const ply = curPly();
+  renderFeedback(ply, settings.classify ? classAt(ply) : null, evalAt(ply));
+}
+
+function thinking(fen) {
+  const d = progress.get(fen);
+  return d ? ` <span class="muted">(глубина ${d}/${DEPTH})</span>` : '';
+}
+
 function renderFeedback(ply, cls, an) {
   const box = $('#feedback');
   const parts = [];
@@ -341,7 +426,8 @@ function renderFeedback(ply, cls, an) {
             <span class="muted">(${formatScore(prev.score)})</span></div>`);
         }
       } else {
-        parts.push(`<div class="muted">Stockfish оценивает ход <b>${m.san}</b>…</div>`);
+        const f = evalAt(ply - 1) ? S.positions[ply] : S.positions[ply - 1];
+        parts.push(`<div class="muted">Stockfish оценивает ход <b>${m.san}</b>…${thinking(f)}</div>`);
       }
     } else if (ply === 0) {
       parts.push('<div class="muted">Начальная позиция</div>');
@@ -350,7 +436,7 @@ function renderFeedback(ply, cls, an) {
       parts.push(an?.best
         ? `<div class="fb-sub">Лучший ход сейчас: <b>${uciToSan(S.positions[ply], an.best)}</b>
            <span class="muted">(${formatScore(an.score)}, глубина ${an.depth})</span></div>`
-        : '<div class="fb-sub muted">Ищу лучший ход…</div>');
+        : `<div class="fb-sub muted">Ищу лучший ход…${thinking(S.positions[ply])}</div>`);
     }
   }
   box.innerHTML = parts.join('');
@@ -453,6 +539,7 @@ function startLocal() {
   resetGame();
   $('#chatLog').textContent = '';
   showGame();
+  Sounds.play('start');
 }
 
 // ---------- сеть ----------
@@ -495,6 +582,7 @@ function startOnlineAsHost(color) {
   S.orientation = color;
   resetGame();
   showGame();
+  Sounds.play('start');
 }
 
 function doRematch() {
@@ -516,6 +604,7 @@ function applySync(d) {
     S.orientation = d.guestColor;
     resetGame();
     showScreen('game');
+    if (!d.moves.length) Sounds.play('start');
   }
   for (let i = S.moves.length; i < d.moves.length; i++) applyMove(d.moves[i], { silent: true });
   if (d.result) S.result = d.result;
@@ -551,10 +640,12 @@ function onNet(d) {
     case 'move':
       if (S.mode !== 'online') return;
       if (d.gameNo !== S.gameNo || d.ply !== S.moves.length || S.game.turn() === S.myColor || S.result) return resync();
-      if (!applyMove({ from: d.from, to: d.to, promotion: d.promotion })) resync();
+      if (!applyMove({ from: d.from, to: d.to, promotion: d.promotion })) return resync();
+      tryPremove();
       break;
     case 'resign':
-      if (!S.result) S.result = { winner: S.myColor, reason: 'соперник сдался' };
+      if (!S.result) { S.result = { winner: S.myColor, reason: 'соперник сдался' }; Sounds.play('end'); }
+      S.premove = null;
       render();
       break;
     case 'draw':
@@ -562,8 +653,9 @@ function onNet(d) {
       render();
       break;
     case 'drawAccept':
-      if (!S.result) S.result = { winner: null, reason: 'по соглашению' };
+      if (!S.result) { S.result = { winner: null, reason: 'по соглашению' }; Sounds.play('end'); }
       S.drawOffer = null;
+      S.premove = null;
       render();
       break;
     case 'drawDecline':
@@ -743,6 +835,8 @@ $('#btnNewLocal').onclick = () => { resetGame(); render(); };
 $('#btnResign').onclick = () => {
   if (S.result || !confirm('Сдаться?')) return;
   S.result = { winner: opp(S.myColor), reason: 'вы сдались' };
+  S.premove = null;
+  Sounds.play('end');
   net?.send({ t: 'resign' });
   render();
 };
@@ -792,8 +886,6 @@ $('#chatForm').addEventListener('submit', (e) => {
 const dlg = $('#settingsDlg');
 $('#btnSettings').onclick = () => {
   for (const k of ['evalBar', 'classify', 'bestMove', 'coords', 'sound']) $('#set-' + k).checked = settings[k];
-  $('#set-depth').value = settings.depth;
-  $('#depthVal').textContent = settings.depth;
   dlg.showModal();
 };
 $('#btnCloseSettings').onclick = () => dlg.close();
@@ -801,16 +893,13 @@ dlg.addEventListener('click', (e) => { if (e.target === dlg) dlg.close(); });
 for (const k of ['evalBar', 'classify', 'bestMove', 'coords', 'sound']) {
   $('#set-' + k).addEventListener('change', (e) => {
     settings[k] = e.target.checked;
+    Sounds.enabled = settings.sound;
     saveSettings();
+    if (k === 'sound' && settings.sound) Sounds.play('move');
     requestAnalysis();
     render();
   });
 }
-$('#set-depth').addEventListener('input', (e) => {
-  settings.depth = +e.target.value;
-  $('#depthVal').textContent = settings.depth;
-  saveSettings();
-});
 
 // ---------- старт ----------
 const joinParam = new URLSearchParams(location.search).get('join');

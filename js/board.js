@@ -18,12 +18,20 @@ function el(tag, cls) {
   return e;
 }
 
+// Цвета пометок правой кнопкой: без модификатора / Shift / Ctrl / Alt
+const ANNOT = { def: '#f2a33a', shift: '#5fae3e', ctrl: '#e0443b', alt: '#3d9be9' };
+const annotColor = (e) => (e.shiftKey ? ANNOT.shift : e.ctrlKey || e.metaKey ? ANNOT.ctrl : e.altKey ? ANNOT.alt : ANNOT.def);
+
 export class Board {
-  constructor(root, { canMove, targets, onMove }) {
+  constructor(root, { canMove, targets, onMove, onDeselect }) {
     this.root = root;
     this.canMove = canMove;
     this.targets = targets;
     this.onMove = onMove;
+    this.onDeselect = onDeselect || (() => {});
+    this.userArrows = []; // {from,to,color}
+    this.marks = new Map(); // sq -> color
+    this.rdrag = null;
     this.orientation = 'w';
     this.selected = null;
     this.drag = null;
@@ -79,6 +87,10 @@ export class Board {
   clearSelection() {
     this.selected = null;
   }
+  clearAnnotations() {
+    this.userArrows = [];
+    this.marks.clear();
+  }
 
   // view: { pieces: {sq: {color,type}}, lastMove, check, badge, arrows, coords }
   render(view) {
@@ -100,8 +112,14 @@ export class Board {
       if (v.lastMove && (v.lastMove.from === sq || v.lastMove.to === sq)) cls += ' last';
       if (this.selected === sq) cls += ' sel';
       if (v.check === sq) cls += ' check';
+      if (v.premove && (v.premove.from === sq || v.premove.to === sq)) cls += ' pre';
       cell.className = cls;
       cell.textContent = '';
+      if (this.marks.has(sq)) {
+        const m = el('div', 'mark');
+        m.style.background = this.marks.get(sq);
+        cell.append(m);
+      }
 
       if (v.coords) {
         if (c === 0) { const s = el('span', 'coord rank'); s.textContent = sq[1]; cell.append(s); }
@@ -116,7 +134,7 @@ export class Board {
         if (this.drag && this.drag.moved && this.drag.from === sq) img.classList.add('ghosted');
         cell.append(img);
       }
-      if (targets.includes(sq)) cell.append(el('div', p ? 'hint cap' : 'hint'));
+      if (targets.includes(sq)) cell.append(el('div', (p ? 'hint cap' : 'hint') + (v.premoveMode ? ' prehint' : '')));
       if (v.badge && v.badge.sq === sq) {
         const b = el('div', 'badge');
         b.style.background = v.badge.color;
@@ -130,7 +148,7 @@ export class Board {
 
   _drawArrows() {
     this.svg.textContent = '';
-    for (const a of this.view?.arrows || []) {
+    for (const a of [...(this.view?.arrows || []), ...this.userArrows]) {
       const s = this._rc(a.from), e = this._rc(a.to);
       const sx = s.c * 100 + 50, sy = s.r * 100 + 50;
       const ex = e.c * 100 + 50, ey = e.r * 100 + 50;
@@ -154,9 +172,18 @@ export class Board {
   }
 
   _down(e) {
-    if (e.button !== 0 || this.promoOpen) return;
+    if (this.promoOpen) return;
     const sq = this._pointSq(e.clientX, e.clientY);
     if (!sq) return;
+    if (e.button === 2) {
+      // Правая кнопка: рисуем стрелку или отмечаем поле (как на chess.com)
+      this.rdrag = { from: sq, color: annotColor(e) };
+      if (this.selected) { this.selected = null; this._draw(); }
+      this.onDeselect(true);
+      return;
+    }
+    if (e.button !== 0) return;
+    if (this.userArrows.length || this.marks.size) this.clearAnnotations();
     if (this.selected && sq !== this.selected && this.targets(this.selected).includes(sq)) {
       const from = this.selected;
       this.selected = null;
@@ -173,6 +200,26 @@ export class Board {
       return;
     }
     this.selected = null;
+    this.onDeselect(false);
+    this._draw();
+  }
+
+  _rightUp(e) {
+    const r = this.rdrag;
+    this.rdrag = null;
+    const to = this._pointSq(e.clientX, e.clientY);
+    if (!to) return;
+    if (to === r.from) {
+      if (this.marks.get(to) === r.color) this.marks.delete(to);
+      else this.marks.set(to, r.color);
+    } else {
+      const i = this.userArrows.findIndex((a) => a.from === r.from && a.to === to);
+      if (i >= 0 && this.userArrows[i].color === r.color) this.userArrows.splice(i, 1);
+      else {
+        if (i >= 0) this.userArrows.splice(i, 1);
+        this.userArrows.push({ from: r.from, to, color: r.color });
+      }
+    }
     this._draw();
   }
 
@@ -196,6 +243,8 @@ export class Board {
   }
 
   _up(e) {
+    if (e.button === 2 && this.rdrag) return this._rightUp(e);
+    if (e.button !== 0) return;
     const d = this.drag;
     if (!d) return;
     this.drag = null;

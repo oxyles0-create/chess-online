@@ -1,7 +1,13 @@
-// Stockfish в Web Worker. Загружается с CDN, поэтому работает на GitHub Pages без сборки.
-const SF_URL = 'https://cdn.jsdelivr.net/npm/stockfish.js@10.0.2/stockfish.js';
+// Stockfish 18 (NNUE lite, однопоточный WebAssembly) в Web Worker.
+// Файлы движка лежат в папке engine/ рядом с сайтом.
+//
+// Чтобы у обоих игроков оценки совпадали, каждая позиция считается
+// детерминированно: одинаковая фиксированная глубина, один поток и
+// очищенная хеш-таблица (ucinewgame) перед каждым расчётом.
+const SF_URL = new URL('../engine/stockfish-18-lite-single.js', import.meta.url).href;
 
 export const MATE = 100000;
+export const DEPTH = 22;
 
 export class Engine {
   constructor(onStatus = () => {}) {
@@ -11,12 +17,11 @@ export class Engine {
     this.ready = false;
     this.failed = false;
     try {
-      const src = `importScripts(${JSON.stringify(SF_URL)});`;
-      this.w = new Worker(URL.createObjectURL(new Blob([src], { type: 'application/javascript' })));
+      this.w = new Worker(SF_URL);
       this.w.onmessage = (e) => this._line(String(e.data));
       this.w.onerror = () => this._fail();
       this.w.postMessage('uci');
-      this.timeout = setTimeout(() => { if (!this.ready) this._fail(); }, 30000);
+      this.timeout = setTimeout(() => { if (!this.ready) this._fail(); }, 60000);
     } catch {
       this._fail();
     }
@@ -32,7 +37,8 @@ export class Engine {
 
   _line(line) {
     if (line === 'uciok') {
-      this.w.postMessage('setoption name Hash value 32');
+      this.w.postMessage('setoption name Threads value 1');
+      this.w.postMessage('setoption name Hash value 64');
       this.w.postMessage('isready');
       return;
     }
@@ -59,7 +65,7 @@ export class Engine {
         val: parseInt(t[i + 2], 10),
         pv: t.slice(t.indexOf('pv') + 1),
       };
-      if (j.onInfo) j.onInfo(this._result(j, null));
+      j.onProgress?.(j.info.depth);
       return;
     }
     if (line.startsWith('bestmove')) {
@@ -84,10 +90,14 @@ export class Engine {
     return { score, best: bm, pv: info?.pv || [], depth: info?.depth || 0 };
   }
 
-  analyze(fen, { depth = 14, movetime = 2500, urgent = false } = {}) {
+  get busyFen() {
+    return this.cur?.fen || null;
+  }
+
+  analyze(fen, { urgent = false, onProgress } = {}) {
     if (this.failed) return Promise.resolve(null);
     return new Promise((resolve) => {
-      const job = { fen, depth, movetime, resolve, turn: fen.split(' ')[1] };
+      const job = { fen, resolve, onProgress, turn: fen.split(' ')[1] };
       if (urgent) this.queue.unshift(job); else this.queue.push(job);
       this._pump();
     });
@@ -96,17 +106,15 @@ export class Engine {
   _pump() {
     if (!this.ready || this.cur || !this.queue.length) return;
     const j = (this.cur = this.queue.shift());
+    this.w.postMessage('ucinewgame');
     this.w.postMessage('position fen ' + j.fen);
-    this.w.postMessage(`go depth ${j.depth} movetime ${j.movetime}`);
+    this.w.postMessage(`go depth ${DEPTH}`);
   }
 
-  // Отменить всё, что стоит в очереди (новая партия).
+  // Убрать из очереди всё лишнее (новая партия). Текущий расчёт доводим до конца,
+  // чтобы его результат остался в кэше и совпадал у обоих игроков.
   reset() {
     this.queue.forEach((j) => j.resolve(null));
     this.queue = [];
-    if (this.cur) {
-      this.cur.cancelled = true;
-      this.w.postMessage('stop');
-    }
   }
 }

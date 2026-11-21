@@ -120,6 +120,11 @@ input:focus { outline: 2px solid var(--accent); border-color: transparent; }
 .sq.d { background: var(--dark); }
 .sq.l.last, .sq.l.sel { background: #f5f682; }
 .sq.d.last, .sq.d.sel { background: #b9ca43; }
+.sq.l.pre { background: #d9a4a0; }
+.sq.d.pre { background: #c0766f; }
+.mark { position: absolute; inset: 0; opacity: 0.75; z-index: 0; pointer-events: none; }
+.hint.prehint { background: rgba(120, 20, 20, 0.28); }
+.hint.cap.prehint { background: none; border-color: rgba(120, 20, 20, 0.3); }
 .sq.check { background: radial-gradient(circle, #ff3b3b 0%, #e02020aa 45%, transparent 75%) !important; }
 .piece { width: 100%; height: 100%; pointer-events: none; cursor: grab; position: relative; z-index: 1; }
 .piece.ghosted { opacity: 0.3; }
