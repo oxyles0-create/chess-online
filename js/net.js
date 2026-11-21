@@ -1,17 +1,21 @@
 // P2P-соединение между двумя браузерами через WebRTC (PeerJS).
 // Сервер не нужен: PeerJS использует бесплатный публичный сигнальный сервер,
-// а сами ходы идут напрямую между игроками.
+// а сами ходы идут напрямую между игроками. Публичный сервер иногда сбоит,
+// поэтому при ошибках связи с ним мы бесконечно переподключаемся.
 const randId = () =>
   Array.from(crypto.getRandomValues(new Uint8Array(6)), (b) => 'abcdefghjkmnpqrstuvwxyz23456789'[b % 31]).join('');
 
+const SERVER_ERRORS = new Set(['network', 'server-error', 'socket-error', 'socket-closed', 'disconnected']);
+
 export class Net {
-  // h: { acceptGuest(hello), onOpen(), onClose(), onData(d), onError(err), onStatus(text) }
+  // h: { acceptGuest(hello), onOpen(), onClose(), onData(d), onError(err), onStatus(text), onServer(ok) }
   constructor(handlers) {
     this.h = handlers;
     this.peer = null;
     this.conn = null;
     this.isHost = false;
     this.destroyed = false;
+    this.retries = 0;
   }
 
   static available() {
@@ -20,66 +24,96 @@ export class Net {
 
   host(fixedId) {
     this.isHost = true;
-    return new Promise((resolve, reject) => {
-      let tries = 0;
-      const attempt = () => {
-        if (this.destroyed) return;
-        const id = fixedId || 'chess-' + randId();
-        const peer = new window.Peer(id, { debug: 1 });
-        this.peer = peer;
-        peer.on('open', (pid) => resolve(pid));
-        peer.on('connection', (conn) => this._attach(conn));
-        peer.on('disconnected', () => this._revive());
-        peer.on('error', (err) => {
-          if (err.type === 'unavailable-id' && tries++ < 12) {
-            peer.destroy();
-            this.h.onStatus?.('Код ещё занят прошлой сессией, повтор…');
-            setTimeout(attempt, fixedId ? 3000 : 0);
-            return;
-          }
-          this.h.onError?.(err);
-          reject(err);
-        });
-      };
-      attempt();
+    this.myId = fixedId || 'chess-' + randId();
+    return new Promise((resolve) => {
+      this._resolve = resolve;
+      this._startHost();
     });
   }
 
   join(hostId) {
     this.isHost = false;
     this.hostId = hostId;
-    return new Promise((resolve, reject) => {
-      const peer = new window.Peer({ debug: 1 });
-      this.peer = peer;
-      peer.on('open', () => {
-        this._connect();
-        resolve();
-      });
-      peer.on('disconnected', () => this._revive());
-      peer.on('error', (err) => {
-        if (err.type === 'peer-unavailable') {
-          this.h.onStatus?.('Хозяин игры пока недоступен, жду…');
-          this._scheduleReconnect();
-          return;
-        }
-        this.h.onError?.(err);
-        reject(err);
-      });
+    return new Promise((resolve) => {
+      this._resolve = resolve;
+      this._startGuest();
     });
   }
 
-  _revive() {
-    setTimeout(() => {
-      if (this.peer && !this.peer.destroyed && this.peer.disconnected) {
-        try { this.peer.reconnect(); } catch {}
+  _newPeer(id) {
+    try { this.peer?.destroy(); } catch {}
+    const peer = id ? new window.Peer(id, { debug: 1 }) : new window.Peer({ debug: 1 });
+    this.peer = peer;
+    peer.on('open', () => {
+      if (peer !== this.peer) return;
+      this.retries = 0;
+      this.h.onServer?.(true);
+      this._resolve?.(this.myId);
+      this._resolve = null;
+      if (!this.isHost) this._connect();
+    });
+    peer.on('disconnected', () => {
+      if (peer !== this.peer || this.destroyed) return;
+      setTimeout(() => {
+        if (peer === this.peer && !peer.destroyed && peer.disconnected) {
+          try { peer.reconnect(); } catch {}
+        }
+      }, 1500);
+    });
+    peer.on('error', (err) => {
+      if (peer !== this.peer || this.destroyed) return;
+      this._onPeerError(err);
+    });
+    return peer;
+  }
+
+  _startHost() {
+    if (this.destroyed) return;
+    const peer = this._newPeer(this.myId);
+    peer.on('connection', (conn) => { if (peer === this.peer) this._attach(conn); });
+  }
+
+  _startGuest() {
+    if (this.destroyed) return;
+    this._newPeer(null);
+  }
+
+  _onPeerError(err) {
+    if (err.type === 'peer-unavailable') {
+      this.h.onStatus?.('Друг пока не в сети или игра закрыта, жду…');
+      this._scheduleReconnect();
+      return;
+    }
+    if (err.type === 'unavailable-id' && this.isHost) {
+      // Код ещё числится за прошлым подключением — сервер освободит его через несколько секунд.
+      this._retry('Код игры ещё занят прошлым подключением');
+      return;
+    }
+    if (SERVER_ERRORS.has(err.type)) {
+      this.h.onServer?.(false);
+      // Если с другом уже есть прямое соединение, игра идёт и без сервера.
+      if (this.connected) {
+        setTimeout(() => { if (this.peer?.disconnected) try { this.peer.reconnect(); } catch {} }, 5000);
+        return;
       }
-    }, 1500);
+      this._retry('Сервер соединения не отвечает');
+      return;
+    }
+    this.h.onError?.(err);
+  }
+
+  _retry(reason) {
+    this.retries++;
+    const delay = Math.min(2000 * this.retries, 10000);
+    this.h.onStatus?.(`${reason}. Пробую снова через ${Math.round(delay / 1000)} с (попытка ${this.retries})…`);
+    clearTimeout(this.retryTimer);
+    this.retryTimer = setTimeout(() => (this.isHost ? this._startHost() : this._startGuest()), delay);
   }
 
   _connect() {
-    if (this.destroyed || !this.peer || this.peer.destroyed) return;
+    if (this.destroyed || !this.peer || this.peer.destroyed || this.peer.disconnected) return;
     const conn = this.peer.connect(this.hostId, { reliable: true });
-    this._attach(conn);
+    if (conn) this._attach(conn);
     this._scheduleReconnect();
   }
 
@@ -143,6 +177,7 @@ export class Net {
   destroy() {
     this.destroyed = true;
     clearTimeout(this.rt);
+    clearTimeout(this.retryTimer);
     try { this.conn?.close(); } catch {}
     try { this.peer?.destroy(); } catch {}
     this.conn = null;

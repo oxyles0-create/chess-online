@@ -473,8 +473,9 @@ function makeNet() {
     onData: onNet,
     onStatus: (t) => { if (S.mode === 'waiting') $('#waitStatus').textContent = t; else toast(t); },
     onError: (err) => {
-      const msg = err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error'
-        ? 'Нет связи с сервером PeerJS' : 'Ошибка соединения: ' + err.type;
+      const msg = err.type === 'browser-incompatible'
+        ? 'Браузер не поддерживает WebRTC — откройте сайт в Chrome, Firefox или Edge'
+        : 'Ошибка соединения: ' + err.type;
       if (S.mode === 'waiting') $('#waitStatus').textContent = msg; else toast(msg);
     },
   });
